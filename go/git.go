@@ -36,6 +36,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const agentName = "plenger-forge/1.0.0"
@@ -281,6 +282,7 @@ func readPackInto(v *Vault, pack []byte) bool {
 	pos := 12
 	raw := make([]packEntry, 0, count)
 	indexByStart := map[int]int{}
+	sawDelta := false
 	for i := 0; i < count; i++ {
 		start := pos
 		if pos >= len(pack) {
@@ -336,6 +338,7 @@ func readPackInto(v *Vault, pack []byte) bool {
 			pos = end
 		}
 		if e.hasBase {
+			sawDelta = true
 			delta, end, ok := inflateAt(pack, pos)
 			if !ok {
 				return false
@@ -345,6 +348,15 @@ func readPackInto(v *Vault, pack []byte) bool {
 		}
 		indexByStart[start] = len(raw)
 		raw = append(raw, e)
+	}
+	// The push workload's packs never carry deltas (three plain objects);
+	// with none present, pass 2's resolution map and closure walk are
+	// pure overhead — store the entries as parsed.
+	if !sawDelta {
+		for i := range raw {
+			v.PutObject(raw[i].typ, raw[i].data)
+		}
+		return true
 	}
 	// Pass two: resolve deltas (bases may themselves be deltas).
 	resolved := map[int]struct {
@@ -498,8 +510,12 @@ func stateFingerprint(v *Vault, r *Repo) string {
 	return b.String()
 }
 
-// Per-app answer caches (kept on the App, created lazily).
+// Per-app answer caches (kept on the App, created eagerly by NewApp).
+// The maps are guarded by their own mutex: read-only dispatches run in
+// parallel now, and two concurrent fetches may both miss, build the same
+// bundle and store it — a harmless duplicate build, never a race.
 type gitCaches struct {
+	mu      sync.Mutex
 	answers map[string][]byte
 	adverts map[string][]byte
 }
@@ -512,10 +528,35 @@ func (a *App) gitCache() *gitCaches {
 }
 
 func storeGitAnswer(c *gitCaches, key string, body []byte) {
+	c.mu.Lock()
 	if len(c.answers) >= 512 {
 		c.answers = map[string][]byte{}
 	}
 	c.answers[key] = body
+	c.mu.Unlock()
+}
+
+func loadGitAnswer(c *gitCaches, key string) ([]byte, bool) {
+	c.mu.Lock()
+	body, ok := c.answers[key]
+	c.mu.Unlock()
+	return body, ok
+}
+
+func storeGitAdvert(c *gitCaches, key string, body []byte) {
+	c.mu.Lock()
+	if len(c.adverts) >= 512 {
+		c.adverts = map[string][]byte{}
+	}
+	c.adverts[key] = body
+	c.mu.Unlock()
+}
+
+func loadGitAdvert(c *gitCaches, key string) ([]byte, bool) {
+	c.mu.Lock()
+	body, ok := c.adverts[key]
+	c.mu.Unlock()
+	return body, ok
 }
 
 func (a *App) infoRefs(req *Request, res *Response, repo *Repo, service, protocol string) {
@@ -527,13 +568,28 @@ func (a *App) infoRefs(req *Request, res *Response, repo *Repo, service, protoco
 	}
 	c := a.gitCache()
 	key := service + "\n" + stateFingerprint(v, repo)
-	if hit, ok := c.adverts[key]; ok {
+	if hit, ok := loadGitAdvert(c, key); ok {
 		ct := "application/x-git-upload-pack-advertisement"
 		if !forUpload {
 			ct = "application/x-git-receive-pack-advertisement"
 		}
 		res.Send(200, hit, ct)
 		return
+	}
+	// The push workload re-asks for the receive-pack advertisement after
+	// every push, and every push moves the fingerprint, so the cached
+	// advert never hits there: the general builder (ref walk, per-line
+	// allocations, a join) cost ~17µs of the ~87µs the server spent per
+	// push op. A single-branch repo — the shape the workload and most
+	// trials use — has a two-line advertisement; build it by appends
+	// into one buffer instead. Anything richer (extra refs, tags, an
+	// unborn head) falls through to the general builder unchanged.
+	if !forUpload {
+		if payload, ok := receiveAdvertFast(v, repo, service); ok {
+			storeGitAdvert(c, key, payload)
+			res.Send(200, payload, "application/x-git-receive-pack-advertisement")
+			return
+		}
 	}
 	caps := uploadCapsV0(v, repo)
 	if !forUpload {
@@ -543,15 +599,40 @@ func (a *App) infoRefs(req *Request, res *Response, repo *Repo, service, protoco
 	parts = append(parts, v0RefLines(v, repo, caps)...)
 	parts = append(parts, pktFlush)
 	payload := bytes.Join(parts, nil)
-	if len(c.adverts) >= 512 {
-		c.adverts = map[string][]byte{}
-	}
-	c.adverts[key] = payload
+	storeGitAdvert(c, key, payload)
 	ct := "application/x-git-upload-pack-advertisement"
 	if !forUpload {
 		ct = "application/x-git-receive-pack-advertisement"
 	}
 	res.Send(200, payload, ct)
+}
+
+// receiveAdvertFast builds the v0 receive-pack advertisement for a repo
+// whose only ref is its head branch: service line, flush, the HEAD line
+// carrying the capabilities, the branch line, flush. ok=false when the
+// repo has any other shape.
+func receiveAdvertFast(v *Vault, repo *Repo, service string) ([]byte, bool) {
+	headRef := v.HeadRef(repo)
+	oid, ok := repo.Refs[headRef]
+	if len(repo.Refs) != 1 || !ok || oid == ZeroOID {
+		return nil, false
+	}
+	caps := receiveCaps(v, repo)
+	buf := make([]byte, 0, 512)
+	buf = appendPktLine(buf, "# service="+service+"\n")
+	buf = append(buf, pktFlush...)
+	buf = appendPktLine(buf, oid+" HEAD\x00"+caps+"\n")
+	buf = appendPktLine(buf, oid+" "+headRef+"\n")
+	buf = append(buf, pktFlush...)
+	return buf, true
+}
+
+// appendPktLine appends one pkt-line (4-hex length prefix + payload).
+func appendPktLine(dst []byte, payload string) []byte {
+	n := len(payload) + 4
+	const hexd = "0123456789abcdef"
+	dst = append(dst, hexd[(n>>12)&0xf], hexd[(n>>8)&0xf], hexd[(n>>4)&0xf], hexd[n&0xf])
+	return append(dst, payload...)
 }
 
 // ---------------------------------------------------------------------------
@@ -581,7 +662,7 @@ func (a *App) lsRefs(res *Response, repo *Repo, packets []packet) {
 	c := a.gitCache()
 	cacheID := "ls-refs\n" + strconv.FormatBool(wantPeel) + "\n" + strconv.FormatBool(wantSymrefs) + "\n" +
 		strconv.FormatBool(wantUnborn) + "\n" + strings.Join(prefixes, ",") + "\n" + stateFingerprint(v, repo)
-	if hit, ok := c.answers[cacheID]; ok {
+	if hit, ok := loadGitAnswer(c, cacheID); ok {
 		res.Send(200, hit, "application/x-git-upload-pack-result")
 		return
 	}
@@ -882,7 +963,7 @@ func (a *App) fetchV2(res *Response, repo *Repo, packets []packet) {
 	ask := parseFetchAsk(packets, true)
 	c := a.gitCache()
 	key := a.fetchCacheKey(repo, "fetch-v2", ask)
-	if hit, ok := c.answers[key]; ok {
+	if hit, ok := loadGitAnswer(c, key); ok {
 		res.Send(200, hit, "application/x-git-upload-pack-result")
 		return
 	}
@@ -912,7 +993,7 @@ func (a *App) fetchV0(res *Response, repo *Repo, packets []packet) {
 	ask := parseFetchAsk(packets, false)
 	c := a.gitCache()
 	key := a.fetchCacheKey(repo, "fetch-v0", ask)
-	if hit, ok := c.answers[key]; ok {
+	if hit, ok := loadGitAnswer(c, key); ok {
 		res.Send(200, hit, "application/x-git-upload-pack-result")
 		return
 	}
@@ -1089,7 +1170,17 @@ func (a *App) applyPushCommand(repo *Repo, cmd pushCommand) string {
 		}
 		if current != ZeroOID && cmd.before != ZeroOID {
 			if curTip, ok := v.PeelToCommit(current); ok {
-				if !v.IsAncestor(curTip, commitOID) {
+				// Fast path: the pushed commit's first parent IS the
+				// current tip — every fast-forward chain link, including
+				// the push workload's 200 sequential pushes. One header
+				// scan replaces the ancestry walk.
+				fastFF := false
+				if obj := v.GetObject(commitOID); obj != nil && obj.Type == ObjCommit {
+					if parents := CommitParents(obj.Data); len(parents) > 0 && parents[0] == curTip {
+						fastFF = true
+					}
+				}
+				if !fastFF && !v.IsAncestor(curTip, commitOID) {
 					return "non-fast-forward"
 				}
 			}

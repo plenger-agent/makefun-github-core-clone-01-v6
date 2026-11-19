@@ -13,10 +13,13 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -133,6 +136,28 @@ type CommitInfo struct {
 
 // ParseCommit reads a commit object's headers and message. Only the header
 // block is turned into text; the message is sliced off the raw bytes.
+// CommitParents scans only the parent lines of a commit header — the
+// cheap shape test the push fast-forward fast path needs, without
+// ParseCommit's full ident/message decoding.
+func CommitParents(data []byte) []string {
+	var parents []string
+	for len(data) > 0 {
+		var line []byte
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			line, data = data[:i], data[i+1:]
+		} else {
+			line, data = data, nil
+		}
+		if len(line) == 0 {
+			break // blank line: header over
+		}
+		if bytes.HasPrefix(line, []byte("parent ")) && len(line) == 47 {
+			parents = append(parents, string(line[7:]))
+		}
+	}
+	return parents
+}
+
 func ParseCommit(data []byte) CommitInfo {
 	var info CommitInfo
 	split := -1
@@ -286,11 +311,12 @@ type Vault struct {
 	Repos        map[string]*Repo
 	Login        string
 	HasLogin     bool
+	loginMu      sync.RWMutex
 	tick         int64
 	nextRepoID   int
 	nextIssueID  int
 	nextCmtID    int
-	nextReqNo    int
+	nextReqNo    int64
 }
 
 func NewVault() *Vault {
@@ -300,10 +326,12 @@ func NewVault() *Vault {
 	}
 }
 
-// Seq returns the next deterministic sequence number.
+// Seq returns the next deterministic sequence number. Atomic so read-only
+// dispatches running in parallel can never tear the counter; the values
+// handed out under parallel dispatch may interleave differently than a
+// serial run would, but every value is still unique and monotonic.
 func (v *Vault) Seq() int64 {
-	v.tick++
-	return v.tick
+	return atomic.AddInt64(&v.tick, 1)
 }
 
 func (v *Vault) ISOAtSeq(seq int64) string { return ISOAt(baseEpochSec + seq) }
@@ -312,8 +340,7 @@ func (v *Vault) EpochAt(seq int64) int64   { return baseEpochSec + seq }
 // NextRequestID mints a fixed-width id ("FORGE-" + 6 base-36 digits) so a
 // memoised response head can be patched with a fresh id in place.
 func (v *Vault) NextRequestID() string {
-	v.nextReqNo++
-	n := v.nextReqNo
+	n := int(atomic.AddInt64(&v.nextReqNo, 1))
 	const digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 	var rev [6]byte
 	for i := 5; i >= 0; i-- {
@@ -326,16 +353,30 @@ func (v *Vault) NextRequestID() string {
 // AdoptLogin learns the token owner's login from the first owner-bearing
 // request; after that the login is fixed for the life of the process.
 func (v *Vault) AdoptLogin(owner string) {
-	if !v.HasLogin && owner != "" {
+	if owner == "" {
+		return
+	}
+	v.loginMu.Lock()
+	if !v.HasLogin {
 		v.Login = owner
 		v.HasLogin = true
 	}
+	v.loginMu.Unlock()
 }
 
 // OwnerMatches reports whether `owner` is (or could still become) the
 // token owner's login.
 func (v *Vault) OwnerMatches(owner string) bool {
+	v.loginMu.RLock()
+	defer v.loginMu.RUnlock()
 	return !v.HasLogin || v.Login == owner
+}
+
+// LoginName returns the adopted login ("" before adoption).
+func (v *Vault) LoginName() string {
+	v.loginMu.RLock()
+	defer v.loginMu.RUnlock()
+	return v.Login
 }
 
 // ---------------------------------------------------------------------------

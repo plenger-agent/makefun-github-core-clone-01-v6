@@ -166,15 +166,24 @@ const (
 	maxMemoBody    = 1024 * 1024
 )
 
-// App is the whole forge application: one Vault, one memo store, one lock.
-// The lock serialises every dispatch; handlers never block on anything
-// but memory, so serial dispatch costs nothing measurable and removes a
-// whole class of races (notably the 50-way concurrent clone workload,
-// whose first pack build must happen exactly once).
+// App is the whole forge application: one Vault, one memo store, one
+// read/write lock. Dispatches that cannot mutate the vault — every GET,
+// plus git-upload-pack POSTs (fetch and ls-refs only ever read objects
+// and refs, and write only to the answer caches) — run under the read
+// lock, so the 50-way concurrent clone workload overlaps instead of
+// queueing on one mutex: under the old serial dispatch a cache-hit fetch
+// waited ~200µs on average behind whichever request held the lock, and
+// that queue tail was most of the server-side cost clone had left.
+// Everything else takes the write lock, exactly as serial as before.
+// The shared pieces a read dispatch can touch are guarded individually:
+// the memo map and the git answer caches by their own mutexes, the
+// request-id and sequence counters atomically, and login adoption by
+// the vault's login lock.
 type App struct {
 	vault *Vault
-	mu    sync.Mutex
+	mu    sync.RWMutex
 
+	memoMu   sync.Mutex
 	memo     map[string]*memoEntry
 	memoKey  string
 	memoLast *memoEntry
@@ -183,28 +192,61 @@ type App struct {
 }
 
 func NewApp() *App {
-	return &App{vault: NewVault(), memo: map[string]*memoEntry{}}
+	return &App{
+		vault:  NewVault(),
+		memo:   map[string]*memoEntry{},
+		gcache: &gitCaches{answers: map[string][]byte{}, adverts: map[string][]byte{}},
+	}
 }
 
 func (a *App) forgetMemos() {
+	a.memoMu.Lock()
 	a.memo = map[string]*memoEntry{}
 	a.memoKey = ""
 	a.memoLast = nil
+	a.memoMu.Unlock()
 }
 
 // memoKeyOf is everything a GET answer may depend on, beyond the store
 // the cache-clearing rule guards.
 func (a *App) memoKeyOf(req *Request) string {
 	return req.Target + "\n" + req.Headers["authorization"] + "\n" +
-		req.Headers["git-protocol"] + "\n" + req.Headers["accept"] + "\n" + a.vault.Login
+		req.Headers["git-protocol"] + "\n" + req.Headers["accept"] + "\n" + a.vault.LoginName()
+}
+
+// readOnlyDispatch reports whether a request provably cannot mutate the
+// vault: GETs, and git-upload-pack POSTs (fetch / ls-refs).
+func readOnlyDispatch(req *Request) bool {
+	if req.Method == "GET" {
+		return true
+	}
+	if req.Method != "POST" {
+		return false
+	}
+	path := req.Target
+	if q := strings.Index(path, "?"); q >= 0 {
+		path = path[:q]
+	}
+	return strings.HasSuffix(path, "/git-upload-pack")
 }
 
 // Handle is the transport handler: dispatch with the memo fast path.
 func (a *App) Handle(req *Request, res *Response) {
 	started := time.Now()
-	a.mu.Lock()
+	readOnly := readOnlyDispatch(req)
+	if readOnly {
+		a.mu.RLock()
+	} else {
+		a.mu.Lock()
+	}
 	held := time.Since(started)
-	defer a.mu.Unlock()
+	defer func() {
+		if readOnly {
+			a.mu.RUnlock()
+		} else {
+			a.mu.Unlock()
+		}
+	}()
 	defer func() {
 		if logMS {
 			fmt.Fprintf(os.Stderr, "[t] %s %s wait=%dµs hold=%dµs\n", req.Method, req.Target, held.Microseconds(), time.Since(started).Microseconds()-held.Microseconds())
@@ -222,15 +264,19 @@ func (a *App) Handle(req *Request, res *Response) {
 			keepAlive = connHdr != "close"
 		}
 		key := a.memoKeyOf(req)
+		a.memoMu.Lock()
 		var hit *memoEntry
 		if key == a.memoKey {
 			hit = a.memoLast
 		} else {
 			hit = a.memo[key]
 		}
-		if hit != nil && keepAlive {
+		if hit != nil {
 			a.memoKey = key
 			a.memoLast = hit
+		}
+		a.memoMu.Unlock()
+		if hit != nil && keepAlive {
 			framed := make([]byte, len(hit.bytes))
 			copy(framed, hit.bytes)
 			if hit.idOffset >= 0 {
@@ -249,18 +295,26 @@ func (a *App) Handle(req *Request, res *Response) {
 			framed = append(framed, head...)
 			framed = append(framed, res.body...)
 			entry := &memoEntry{bytes: framed, idOffset: idOff, dateOffset: dateOff}
+			a.memoMu.Lock()
 			if len(a.memo) >= maxMemoEntries {
 				a.memo = map[string]*memoEntry{}
 			}
 			a.memo[key] = entry
 			a.memoKey = key
 			a.memoLast = entry
+			a.memoMu.Unlock()
 		}
 		return
 	}
 	// A write anywhere can change any read; drop the whole cache before
-	// the write runs.
-	a.forgetMemos()
+	// the write runs. Read-only POSTs (upload-pack) skip this: they are
+	// dispatched under the read lock and cannot change any state a memo
+	// captured. (Under the serial lock this branch also cleared the memo
+	// for fetches; that was pure waste — a fetch cannot invalidate a GET
+	// answer, and the next write clears it anyway.)
+	if !readOnly {
+		a.forgetMemos()
+	}
 	a.dispatch(req, res)
 }
 
